@@ -300,7 +300,7 @@ public final class MainActivity extends Activity {
                 .setNegativeButton("跳过", (d, which) -> PaymentPrompts.decide(this, row.id, Ledger.SKIPPED))
                 .create();
         if (row.cents == null) dialog.setButton(AlertDialog.BUTTON_NEUTRAL, "稍后",
-                (android.content.DialogInterface.OnClickListener) null);
+                (d, which) -> PaymentPrompts.showFeedback(this, Ledger.PENDING, null, false));
         showDialog(dialog);
     }
 
@@ -353,7 +353,10 @@ public final class MainActivity extends Activity {
                         System.currentTimeMillis(), Payment.MANUAL, ""));
                 month = YearMonth.now(ZONE);
                 ledger.changed();
-            } else if (ledger.decide(row.id, Ledger.SAVED, cents, description)) PaymentPrompts.cancel(this, row.id);
+            } else if (ledger.decide(row.id, Ledger.SAVED, cents, description)) {
+                PaymentPrompts.cancel(this, row.id);
+                if (row.state != Ledger.SAVED) PaymentPrompts.showFeedback(this, Ledger.SAVED, cents, false);
+            }
             dialog.dismiss();
         });
         amount.requestFocus();
@@ -453,10 +456,7 @@ public final class MainActivity extends Activity {
         PaymentScreen screen = PaymentScreen.connected;
         if (screen != null && screen.preview()) return;
         android.app.Dialog dialog = new android.app.Dialog(this);
-        PaymentCard card = new PaymentCard(this, Payment.WECHAT, dialog::dismiss, dialog::dismiss,
-                dialog::dismiss, null);
-        card.showPayment(2800L, "午餐 · 示例付款");
-        dialog.setContentView(card);
+        dialog.setContentView(PaymentCard.preview(this, dialog::dismiss));
         dialog.show();
         android.view.Window window = dialog.getWindow();
         if (window != null) {

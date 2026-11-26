@@ -7,6 +7,7 @@ import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
 import android.net.Uri;
+import android.widget.Toast;
 
 final class PaymentPrompts {
     static final String CHANNEL = "payments";
@@ -83,6 +84,21 @@ final class PaymentPrompts {
     static void decide(Context context, long id, int state) {
         Ledger ledger = Ledger.get(context);
         Ledger.Entry row = ledger.entry(id);
-        if (row != null && row.state == Ledger.PENDING && ledger.decide(id, state, null, null)) cancel(context, id);
+        if (row != null && row.state == Ledger.PENDING && ledger.decide(id, state, null, null)) {
+            cancel(context, id);
+            showFeedback(context, state, row.cents, false);
+        }
+    }
+
+    static void showFeedback(Context context, int state, Long cents, boolean preview) {
+        String message;
+        if (state == Ledger.SAVED) {
+            message = cents == null ? "已记入账本" : "已记入 " + Payment.format(cents);
+        } else if (state == Ledger.SKIPPED) {
+            message = "已跳过这笔付款";
+        } else {
+            message = "已留在待确认";
+        }
+        Toast.makeText(context, preview ? "示例 · " + message : message, Toast.LENGTH_SHORT).show();
     }
 }

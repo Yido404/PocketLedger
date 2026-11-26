@@ -10,8 +10,11 @@ import android.content.IntentFilter;
 import android.graphics.Bitmap;
 import android.graphics.PixelFormat;
 import android.graphics.Rect;
+import android.graphics.Insets;
+import android.hardware.display.DisplayManager;
 import android.hardware.HardwareBuffer;
 import android.os.Build;
+import android.os.Binder;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.PowerManager;
@@ -19,7 +22,12 @@ import android.os.SystemClock;
 import android.provider.Settings;
 import android.view.Display;
 import android.view.Gravity;
+import android.view.SurfaceControl;
+import android.view.SurfaceControlViewHost;
+import android.view.View;
+import android.view.WindowInsets;
 import android.view.WindowManager;
+import android.view.WindowMetrics;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 import android.view.accessibility.AccessibilityWindowInfo;
@@ -28,6 +36,7 @@ import android.widget.Toast;
 
 import java.io.IOException;
 import java.util.ArrayDeque;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashSet;
 import java.util.Set;
 import java.util.UUID;
@@ -47,6 +56,8 @@ public final class PaymentScreen extends AccessibilityService {
     private final Runnable expire = this::next;
     private final ArrayDeque<Long> queued = new ArrayDeque<>();
     private WindowManager windows;
+    private final IdentityHashMap<View, SurfaceControlViewHost> surfaceOverlays = new IdentityHashMap<>();
+    private boolean preferSurfaceOverlay;
     private PaymentCard overlay;
     private TextView receiptButton;
     private long overlayId;
@@ -62,6 +73,9 @@ public final class PaymentScreen extends AccessibilityService {
     private long observedCheckout, nextCheckoutScan;
     private int checkoutAttempts;
     private boolean checkoutMatched;
+    private boolean checkoutPaused;
+    private boolean checkoutQueryPending;
+    private int checkoutConnectionGeneration;
     private boolean receiverRegistered;
     private boolean inspectQueued;
 
@@ -81,10 +95,11 @@ public final class PaymentScreen extends AccessibilityService {
             if (Intent.ACTION_SCREEN_OFF.equals(intent.getAction())) {
                 PaymentScreen.this.removeOverlay();
                 dismissReceiptLookup();
+                checkoutPaused = true;
                 handler.removeCallbacks(checkoutWatch);
                 while (!queued.isEmpty()) PaymentPrompts.notifyPending(context, queued.removeFirst());
             } else {
-                restartCheckoutWatch();
+                resumeCheckoutWatch();
                 scheduleAlipayProbe();
             }
         }
@@ -92,39 +107,68 @@ public final class PaymentScreen extends AccessibilityService {
 
     @Override protected void onServiceConnected() {
         connected = this;
-        windows = getSystemService(WindowManager.class);
+        windows = null;
+        preferSurfaceOverlay = false;
         bootCount = Settings.Global.getInt(getContentResolver(), Settings.Global.BOOT_COUNT, 0);
         if (!receiverRegistered) {
             IntentFilter powerActions = new IntentFilter(Intent.ACTION_SCREEN_OFF);
             powerActions.addAction(Intent.ACTION_SCREEN_ON);
+            powerActions.addAction(Intent.ACTION_USER_PRESENT);
             registerReceiver(sleep, powerActions);
             receiverRegistered = true;
         }
-        restartCheckoutWatch();
+        checkoutPaused = !getSystemService(PowerManager.class).isInteractive();
+        scheduleCheckoutWatch(0);
         scheduleAlipayProbe();
         BackgroundPaymentService.paymentConnectionsChanged();
     }
 
-    void restartCheckoutWatch() {
-        handler.removeCallbacks(checkoutWatch);
-        if (connected == this && getSystemService(PowerManager.class).isInteractive()) {
-            handler.post(checkoutWatch);
+    private void resumeCheckoutWatch() {
+        if (checkoutPaused) {
+            android.util.Log.d("PocketLedgerCheckout", "Resuming checkout monitoring");
+        }
+        checkoutPaused = false;
+        scheduleCheckoutWatch(0);
+    }
+
+    private void scheduleCheckoutWatch(long delay) {
+        if (connected == this && !checkoutPaused && !checkoutQueryPending && !handler.hasCallbacks(checkoutWatch)) {
+            handler.postDelayed(checkoutWatch, delay);
         }
     }
 
     private void watchWechatCheckout() {
-        if (connected != this || !getSystemService(PowerManager.class).isInteractive()) return;
+        if (connected != this || checkoutPaused) return;
         if (!PaymentOcr.autoEnabled(this) || !WechatCheckout.hasUsageAccess(this)
+                || !getSystemService(PowerManager.class).isInteractive()
                 || getSystemService(KeyguardManager.class).isKeyguardLocked()) {
-            handler.postDelayed(checkoutWatch, 1800);
+            // SCREEN_ON can arrive before the display becomes interactive.
+            scheduleCheckoutWatch(1800);
             return;
         }
+        checkoutQueryPending = true;
+        int connection = checkoutConnectionGeneration;
         WechatCheckout.WORKER.execute(() -> {
-            WechatCheckout checkout = WechatCheckout.active(getApplicationContext());
+            WechatCheckout checkout = null;
+            try {
+                checkout = WechatCheckout.active(getApplicationContext());
+            } catch (RuntimeException exception) {
+                android.util.Log.w("PocketLedgerCheckout", "Could not query WeChat checkout", exception);
+            }
+            WechatCheckout result = checkout;
             handler.post(() -> {
-                if (connected != this || !getSystemService(PowerManager.class).isInteractive()) return;
-                if (checkout != null && PaymentOcr.autoEnabled(this)) inspectWechatCheckout(checkout);
-                if (!handler.hasCallbacks(checkoutWatch)) handler.postDelayed(checkoutWatch, 650);
+                if (connection != checkoutConnectionGeneration) return;
+                checkoutQueryPending = false;
+                if (connected != this || checkoutPaused) return;
+                try {
+                    if (result != null && PaymentOcr.autoEnabled(this)
+                            && getSystemService(PowerManager.class).isInteractive()
+                            && !getSystemService(KeyguardManager.class).isKeyguardLocked()) {
+                        inspectWechatCheckout(result);
+                    }
+                } finally {
+                    scheduleCheckoutWatch(650);
+                }
             });
         });
     }
@@ -166,10 +210,13 @@ public final class PaymentScreen extends AccessibilityService {
     @Override public void onAccessibilityEvent(AccessibilityEvent event) {
         CharSequence packageName = event.getPackageName();
         if (event.getEventType() == AccessibilityEvent.TYPE_WINDOWS_CHANGED) {
+            if (checkoutPaused && getSystemService(PowerManager.class).isInteractive()) resumeCheckoutWatch();
             if (packageName == null || Payment.ALIPAY_PACKAGE.contentEquals(packageName)) scheduleAlipayProbe();
             return;
         }
         if (packageName == null || Payment.platform(packageName.toString()) == null) return;
+        if (checkoutPaused && WechatCheckout.PACKAGE.contentEquals(packageName)
+                && getSystemService(PowerManager.class).isInteractive()) resumeCheckoutWatch();
         if (!activePackage.contentEquals(packageName)) {
             route = "";
             clearRead();
@@ -379,7 +426,7 @@ public final class PaymentScreen extends AccessibilityService {
             params.y = Ui.dp(this, 28);
             params.setTitle("随手账本识别账单");
             try {
-                windows.addView(button, params);
+                addOverlay(button, params);
                 receiptButton = button;
                 android.util.Log.d("PocketLedgerReceipt", "Receipt button displayed");
             } catch (RuntimeException e) {
@@ -400,7 +447,7 @@ public final class PaymentScreen extends AccessibilityService {
     }
 
     private void removeReceiptButton() {
-        if (receiptButton != null && receiptButton.isAttachedToWindow()) windows.removeViewImmediate(receiptButton);
+        if (receiptButton != null) removeOverlayView(receiptButton);
         receiptButton = null;
     }
 
@@ -572,7 +619,10 @@ public final class PaymentScreen extends AccessibilityService {
             PaymentPrompts.openEditor(this, id, true);
             next();
         };
-        PaymentCard panel = new PaymentCard(this, row.platform, this::next, () -> {
+        PaymentCard panel = new PaymentCard(this, row.platform, () -> {
+            next();
+            PaymentPrompts.showFeedback(this, Ledger.PENDING, row.cents, false);
+        }, () -> {
             PaymentPrompts.decide(this, id, Ledger.SKIPPED);
             next();
         }, () -> {
@@ -592,9 +642,7 @@ public final class PaymentScreen extends AccessibilityService {
 
     boolean preview() {
         if (overlay != null) return false;
-        PaymentCard sample = new PaymentCard(this, Payment.WECHAT, this::next, this::next, this::next, null);
-        sample.showPayment(2800L, "午餐 · 示例付款");
-        return display(sample, 0);
+        return display(PaymentCard.preview(this, this::next), 0);
     }
 
     private boolean display(PaymentCard panel, long id) {
@@ -607,7 +655,7 @@ public final class PaymentScreen extends AccessibilityService {
         params.y = Ui.dp(this, 16);
         params.setTitle("随手账本付款提示");
         try {
-            windows.addView(panel, params);
+            addOverlay(panel, params);
         } catch (RuntimeException e) {
             return false;
         }
@@ -615,6 +663,72 @@ public final class PaymentScreen extends AccessibilityService {
         overlayId = id;
         handler.postDelayed(expire, 16_000);
         return true;
+    }
+
+    private void addOverlay(View view, WindowManager.LayoutParams params) {
+        Display display = getSystemService(DisplayManager.class).getDisplay(Display.DEFAULT_DISPLAY);
+        if (windows == null) {
+            if (Build.VERSION.SDK_INT >= 30 && display != null) {
+                windows = createWindowContext(display, WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY, null)
+                        .getSystemService(WindowManager.class);
+            } else {
+                windows = getSystemService(WindowManager.class);
+            }
+        }
+        if (!preferSurfaceOverlay) {
+            try {
+                windows.addView(view, params);
+                return;
+            } catch (WindowManager.BadTokenException exception) {
+                if (Build.VERSION.SDK_INT < 34 || display == null) throw exception;
+                preferSurfaceOverlay = true;
+            }
+        }
+        addSurfaceOverlay(view, params, display);
+    }
+
+    private void addSurfaceOverlay(View view, WindowManager.LayoutParams params, Display display) {
+        WindowMetrics metrics = windows.getCurrentWindowMetrics();
+        Rect bounds = metrics.getBounds();
+        Insets navigation = metrics.getWindowInsets().getInsetsIgnoringVisibility(WindowInsets.Type.navigationBars());
+        int availableWidth = bounds.width() - navigation.left - navigation.right;
+        int availableHeight = bounds.height() - navigation.bottom;
+        int widthLimit = params.width > 0 ? Math.min(params.width, availableWidth) : availableWidth;
+        view.measure(View.MeasureSpec.makeMeasureSpec(widthLimit,
+                        params.width > 0 ? View.MeasureSpec.EXACTLY : View.MeasureSpec.AT_MOST),
+                View.MeasureSpec.makeMeasureSpec(availableHeight, View.MeasureSpec.AT_MOST));
+        int width = view.getMeasuredWidth();
+        int height = view.getMeasuredHeight();
+        int x = (params.gravity & Gravity.HORIZONTAL_GRAVITY_MASK) == Gravity.RIGHT
+                ? bounds.right - navigation.right - params.x - width
+                : bounds.left + navigation.left + (availableWidth - width) / 2;
+        int y = bounds.bottom - navigation.bottom - params.y - height;
+        SurfaceControlViewHost host = new SurfaceControlViewHost(createDisplayContext(display), display, new Binder());
+        try {
+            host.setView(view, width, height);
+            SurfaceControlViewHost.SurfacePackage surfacePackage = host.getSurfacePackage();
+            if (surfacePackage == null) throw new IllegalStateException("Accessibility overlay surface unavailable");
+            try (SurfaceControl.Transaction transaction = new SurfaceControl.Transaction()) {
+                SurfaceControl surface = surfacePackage.getSurfaceControl();
+                attachAccessibilityOverlayToDisplay(display.getDisplayId(), surface);
+                transaction.setPosition(surface, x, y).setVisibility(surface, true).apply();
+            } finally {
+                surfacePackage.release();
+            }
+            surfaceOverlays.put(view, host);
+        } catch (RuntimeException exception) {
+            host.release();
+            throw exception;
+        }
+    }
+
+    private void removeOverlayView(View view) {
+        SurfaceControlViewHost host = surfaceOverlays.remove(view);
+        if (host != null) {
+            host.release();
+        } else if (view.isAttachedToWindow()) {
+            windows.removeViewImmediate(view);
+        }
     }
 
     void refresh(long id) {
@@ -634,7 +748,7 @@ public final class PaymentScreen extends AccessibilityService {
 
     private void removeOverlay() {
         handler.removeCallbacks(expire);
-        if (overlay != null && overlay.isAttachedToWindow()) windows.removeViewImmediate(overlay);
+        if (overlay != null) removeOverlayView(overlay);
         overlay = null;
         overlayId = 0;
     }
@@ -645,6 +759,9 @@ public final class PaymentScreen extends AccessibilityService {
             BackgroundPaymentService.paymentConnectionsChanged();
         }
         handler.removeCallbacksAndMessages(null);
+        checkoutPaused = true;
+        checkoutQueryPending = false;
+        checkoutConnectionGeneration++;
         inspectQueued = false;
         checkoutAt = -1;
         dismissReceiptLookup();

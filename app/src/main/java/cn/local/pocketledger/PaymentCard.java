@@ -38,4 +38,20 @@ final class PaymentCard extends LinearLayout {
         detail.setText(cents == null ? "填写金额后即可记入" : merchant.isEmpty() ? "要记入本月支出吗？" : merchant);
         save.setText(cents == null ? "填写金额" : "记入");
     }
+
+    static PaymentCard preview(Context context, Runnable dismiss) {
+        long sampleCents = 2800L;
+        PaymentCard sample = new PaymentCard(context, Payment.WECHAT, () -> {
+            dismiss.run();
+            PaymentPrompts.showFeedback(context, Ledger.PENDING, sampleCents, true);
+        }, () -> {
+            dismiss.run();
+            PaymentPrompts.showFeedback(context, Ledger.SKIPPED, sampleCents, true);
+        }, () -> {
+            dismiss.run();
+            PaymentPrompts.showFeedback(context, Ledger.SAVED, sampleCents, true);
+        }, null);
+        sample.showPayment(sampleCents, "午餐 · 示例付款");
+        return sample;
+    }
 }
