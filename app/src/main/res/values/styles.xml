@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="screen_description">识别微信和支付宝付款并弹出记账提示。按你选择在手机上识别微信付款画面，识别后立即丢弃画面。</string>
+    <style name="AppTheme" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#275749</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:navigationBarColor">#F5F6F0</item>
+        <item name="android:statusBarColor">#F5F6F0</item>
+        <item name="android:windowBackground">#F5F6F0</item>
+        <item name="android:windowActionModeOverlay">true</item>
+    </style>
+</resources>
